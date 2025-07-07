@@ -15,6 +15,9 @@ const { Schema, model } = require("mongoose")
 const app = express()
 const server = http.createServer(app)
 
+// Настройка trust proxy для работы за прокси (Render.com)
+app.set('trust proxy', 1)
+
 // Безопасность
 app.use(
   helmet({
@@ -23,19 +26,25 @@ app.use(
   }),
 )
 
-// Rate limiting
+// Rate limiting с правильной настройкой для прокси
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 минут
   max: 100, // максимум 100 запросов
   message: "Слишком много запросов, попробуйте позже",
   standardHeaders: true,
   legacyHeaders: false,
+  // Настройка для работы за прокси
+  skip: (req) => req.ip === '127.0.0.1' || req.ip === '::1',
 })
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5, // максимум 5 попыток входа
   message: "Слишком много попыток входа, подождите 15 минут",
+  standardHeaders: true,
+  legacyHeaders: false,
+  // Настройка для работы за прокси
+  skip: (req) => req.ip === '127.0.0.1' || req.ip === '::1',
 })
 
 // Конфигурация
@@ -88,15 +97,8 @@ const io = socketIo(server, {
 })
 
 // Хранилище данных (в продакшене использовать базу данных)
-const users = new Map() // userId -> user data
-const usersByEmail = new Map() // email -> userId
-const usersByUsername = new Map() // username -> userId
-const chats = new Map() // chatId -> chat data
-const messages = new Map() // chatId -> messages array
-const userChats = new Map() // userId -> Set of chatIds
 const activeConnections = new Map() // socketId -> userId
 const typingUsers = new Map() // chatId -> Set of userIds
-const messageReactions = new Map() // messageId -> reactions array
 const blockedUsers = new Map() // userId -> Set of blocked userIds
 
 // Middleware для проверки JWT
@@ -123,39 +125,6 @@ const validatePassword = (password) => password && password.length >= 8
 const validateUsername = (username) => /^@[a-zA-Z0-9_]{3,20}$/.test(username)
 
 // Утилиты
-const getUserChats = (userId) => {
-  const userChatIds = userChats.get(userId) || new Set()
-  const userChatList = []
-
-  for (const chatId of userChatIds) {
-    const chat = chats.get(chatId)
-    if (chat) {
-      const isParticipant =
-        chat.participants.some((p) => p.id === userId) || chat.createdBy === userId
-
-      if (isParticipant) {
-        const lastMessage = messages.get(chatId)?.slice(-1)[0] || null
-        userChatList.push({
-          ...chat,
-          lastMessage,
-          messageCount: messages.get(chatId)?.length || 0,
-          unreadCount: 0, // TODO: Implement unread count logic
-        })
-      }
-    }
-  }
-
-  return userChatList.sort((a, b) => {
-    if (a.isPinned && !b.isPinned) return -1
-    if (!a.isPinned && b.isPinned) return 1
-
-    const aTime = a.lastMessage ? new Date(a.lastMessage.timestamp) : new Date(a.createdAt)
-    const bTime = b.lastMessage ? new Date(b.lastMessage.timestamp) : new Date(b.createdAt)
-
-    return bTime - aTime
-  })
-}
-
 const encryptMessage = (message) => {
   return Buffer.from(message, "utf8").toString("base64")
 }
@@ -171,22 +140,7 @@ const decryptMessage = (encrypted) => {
 // Эмодзи для реакций
 const reactionEmojis = ["❤️", "👍", "👎", "😂", "😮", "😢", "😡", "🔥", "👏", "🎉"]
 
-// Функция для безопасного обновления пользователя
-const updateUserSafely = (userId, updates) => {
-  const user = users.get(userId)
-  if (!user) return false
-  
-  const updatedUser = { ...user, ...updates }
-  users.set(userId, updatedUser)
-  return true
-}
 
-// Функция для проверки доступа к чату
-const hasChatAccess = (userId, chatId) => {
-  const chat = chats.get(chatId)
-  if (!chat) return false
-  return chat.participants.some((p) => p.id === userId) || chat.createdBy === userId
-}
 
 // Главная страница
 app.get("/", (req, res) => {
@@ -601,28 +555,38 @@ app.get("/api/messages/:chatId", authenticateToken, async (req, res) => {
   }
 })
 
-// Socket.IO аутентификация
-io.use((socket, next) => {
-  const token = socket.handshake.auth.token
+// Socket.IO аутентификация (MongoDB)
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth.token
 
-  if (!token) {
-    return next(new Error("Токен аутентификации обязателен"))
+    if (!token) {
+      return next(new Error("Токен аутентификации обязателен"))
+    }
+
+    jwt.verify(token, JWT_SECRET, async (err, decoded) => {
+      if (err) {
+        return next(new Error("Недействительный или истекший токен"))
+      }
+
+      try {
+        const user = await User.findById(decoded.userId).lean()
+        if (!user) {
+          return next(new Error("Пользователь не найден"))
+        }
+
+        socket.userId = user._id.toString()
+        socket.user = user
+        next()
+      } catch (error) {
+        console.error("Socket auth error:", error)
+        return next(new Error("Ошибка аутентификации"))
+      }
+    })
+  } catch (error) {
+    console.error("Socket auth error:", error)
+    return next(new Error("Ошибка аутентификации"))
   }
-
-  jwt.verify(token, JWT_SECRET, (err, decoded) => {
-    if (err) {
-      return next(new Error("Недействительный или истекший токен"))
-    }
-
-    const user = users.get(decoded.userId)
-    if (!user) {
-      return next(new Error("Пользователь не найден"))
-    }
-
-    socket.userId = decoded.userId
-    socket.user = user
-    next()
-  })
 })
 
 // Socket.IO обработчики
@@ -634,38 +598,81 @@ io.on("connection", async (socket) => {
   // При подключении обновлять статус пользователя в MongoDB
   await User.findByIdAndUpdate(user.id, { isOnline: true, lastSeen: new Date(), status: "online" })
 
-  // Присоединяем пользователя ко всем его чатам
-  const userChatIds = userChats.get(user.id) || new Set();
-  for (const chatId of userChatIds) {
-    socket.join(chatId);
+  // Присоединяем пользователя ко всем его чатам (MongoDB)
+  try {
+    const userChats = await Chat.find({ participants: user.id }).lean()
+    for (const chat of userChats) {
+      socket.join(chat._id.toString())
+    }
+  } catch (error) {
+    console.error("Error joining user chats:", error)
   }
 
-  // Получение чатов пользователя
-  socket.on("get_my_chats", (userId) => {
-    if (userId === user.id) {
-      const userChatList = getUserChats(userId)
-      socket.emit("my_chats", userChatList)
+  // Получение чатов пользователя (MongoDB)
+  socket.on("get_my_chats", async (userId) => {
+    try {
+      if (userId === user.id) {
+        const chats = await Chat.find({ participants: user.id })
+          .populate("participants", "_id username fullName avatar isOnline isVerified status")
+          .lean()
+        
+        const chatList = await Promise.all(
+          chats.map(async (chat) => {
+            const lastMessage = await Message.findOne({ chat: chat._id })
+              .sort({ timestamp: -1 })
+              .lean()
+            const messageCount = await Message.countDocuments({ chat: chat._id })
+            return {
+              ...chat,
+              id: chat._id.toString(),
+              lastMessage: lastMessage
+                ? {
+                    ...lastMessage,
+                    id: lastMessage._id.toString(),
+                    senderId: lastMessage.sender?.toString(),
+                    chatId: lastMessage.chat?.toString(),
+                  }
+                : null,
+              messageCount,
+              unreadCount: 0,
+            }
+          })
+        )
+        socket.emit("my_chats", chatList)
+      }
+    } catch (error) {
+      console.error("get_my_chats error:", error)
+      socket.emit("my_chats", [])
     }
   })
 
-  // Получение сообщений
-  socket.on("get_messages", (data) => {
-    const { chatId, userId } = data
+  // Получение сообщений (MongoDB)
+  socket.on("get_messages", async (data) => {
+    try {
+      const { chatId, userId } = data
+      if (userId !== user.id) return
 
-    if (userId !== user.id) return
+      const chat = await Chat.findById(chatId)
+      if (!chat) return
 
-    const chat = chats.get(chatId)
-    if (!chat) return
+      if (!chat.participants.map((id) => id.toString()).includes(user.id)) return
 
-    const hasAccess = hasChatAccess(userId, chatId)
+      const chatMessages = await Message.find({ chat: chatId })
+        .sort({ timestamp: 1 })
+        .lean()
 
-    if (hasAccess) {
-      const chatMessages = messages.get(chatId) || []
       const decryptedMessages = chatMessages.map((msg) => ({
         ...msg,
+        id: msg._id.toString(),
+        senderId: msg.sender?.toString(),
+        chatId: msg.chat?.toString(),
         content: msg.isEncrypted ? decryptMessage(msg.content) : msg.content,
       }))
+
       socket.emit("chat_messages", { chatId, messages: decryptedMessages })
+    } catch (error) {
+      console.error("get_messages error:", error)
+      socket.emit("chat_messages", { chatId, messages: [] })
     }
   })
 
@@ -756,16 +763,18 @@ io.on("connection", async (socket) => {
     }
   })
 
-  // Присоединение к чату
-  socket.on("join_chat", (chatId) => {
-    const chat = chats.get(chatId)
-    if (!chat) return
+  // Присоединение к чату (MongoDB)
+  socket.on("join_chat", async (chatId) => {
+    try {
+      const chat = await Chat.findById(chatId)
+      if (!chat) return
 
-    const hasAccess = hasChatAccess(user.id, chatId)
+      if (!chat.participants.map((id) => id.toString()).includes(user.id)) return
 
-    if (hasAccess) {
       socket.join(chatId)
       console.log(`📥 ${user.username} присоединился к чату: ${chatId}`)
+    } catch (error) {
+      console.error("join_chat error:", error)
     }
   })
 
@@ -992,14 +1001,39 @@ process.on("SIGINT", () => {
   })
 })
 
-mongoose.connect("mongodb+srv://actogol:actogolsila@actogramuz.6ogftpx.mongodb.net/actogram?retryWrites=true&w=majority&appName=actogramUZ", {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-}).then(() => {
-  console.log("✅ MongoDB подключен");
-}).catch((err) => {
-  console.error("❌ Ошибка подключения к MongoDB:", err);
-});
+// Подключение к MongoDB с обработкой ошибок
+const connectToMongoDB = async () => {
+  try {
+    await mongoose.connect("mongodb+srv://actogol:actogolsila@actogramuz.6ogftpx.mongodb.net/actogram?retryWrites=true&w=majority&appName=actogramUZ", {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000,
+      bufferCommands: false,
+      bufferMaxEntries: 0,
+    })
+    console.log("✅ MongoDB подключен")
+  } catch (err) {
+    console.error("❌ Ошибка подключения к MongoDB:", err.message)
+    console.log("💡 Убедитесь, что IP адреса Render.com добавлены в белый список MongoDB Atlas")
+    console.log("🔗 Ссылка для настройки: https://cloud.mongodb.com/v2/your-cluster-id/security/network/access")
+    
+    // Повторная попытка через 5 секунд
+    setTimeout(connectToMongoDB, 5000)
+  }
+}
+
+// Запуск подключения к MongoDB
+connectToMongoDB()
+
+// Обработка ошибок подключения
+mongoose.connection.on('error', (err) => {
+  console.error('MongoDB connection error:', err)
+})
+
+mongoose.connection.on('disconnected', () => {
+  console.log('MongoDB disconnected')
+})
 
 const UserSchema = new Schema({
   email: { type: String, unique: true },
